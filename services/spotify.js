@@ -9,68 +9,95 @@ const spotifyApi = new SpotifyWebApi({
     redirectUri: `http://localhost:3000`,
 });
 
-let accessToken = null;
+const FETCH_TIMEOUT = 5000;
+
+const fetchWithTimeout = async url => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        return response;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        throw error;
+    }
+};
+
+function sanitizeQuery(query) {
+    return query
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[&/\\#,+()$~%.'":*?<>{}!¡¿]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
 
 async function refreshAccessToken() {
     try {
         const data = await spotifyApi.clientCredentialsGrant();
-        accessToken = data.body["access_token"];
-        spotifyApi.setAccessToken(accessToken);
-        console.log("Access token refreshed successfully");
+        const token = data.body["access_token"];
+        spotifyApi.setAccessToken(token);
+        return token;
     } catch (error) {
         console.error("Error refreshing access token:", error);
         throw error;
     }
 }
 
-async function searchSpotify(query) {
-    if (!accessToken) await refreshAccessToken();
-
+async function getSpotifyPreviewUrl(trackId) {
     try {
-        const result = await spotifyApi.searchTracks(query, { limit: 1 });
-        return result.body.tracks.items[0];
+        const response = await fetchWithTimeout(
+            `https://open.spotify.com/embed/track/${trackId}`
+        );
+        const html = await response.text();
+        const match = html.match(/audioPreview":\s*{\s*"url":\s*"([^"]+)"/);
+        return match ? match[1] : null;
     } catch (error) {
-        if (error.statusCode === 401) {
-            console.log("Access token expired, refreshing...");
-            await refreshAccessToken();
-            const result = await spotifyApi.searchTracks(query, { limit: 1 });
-            return result.body.tracks.items[0];
-        } else {
-            console.error("Error searching Spotify:", error);
-            throw error;
-        }
+        console.error("Failed to fetch preview URL:", error);
+        return null;
     }
 }
 
-async function searchFallback(query) {
+async function searchSpotify(query) {
+    if (!spotifyApi.getAccessToken()) {
+        await refreshAccessToken();
+    }
+
     try {
-        const response = await fetch(
-            `https://api.lyrics.ovh/suggest/${encodeURIComponent(query)}`
-        );
-        const data = await response.json();
-        return data.data[0];
+        const result = await spotifyApi.searchTracks(sanitizeQuery(query), {
+            limit: 1,
+        });
+        return result.body.tracks.items[0];
     } catch (error) {
-        console.error("Error in fallback search:", error);
+        if (error.statusCode === 401) {
+            await refreshAccessToken();
+            const result = await spotifyApi.searchTracks(sanitizeQuery(query), {
+                limit: 1,
+            });
+            return result.body.tracks.items[0];
+        }
         throw error;
     }
 }
 
 async function searchAndDownloadSong(query) {
     try {
-        let song = await searchSpotify(query);
-
-        if (!song || !song.preview_url) {
-            song = await searchFallback(query);
-            console.log("Fallback was used");
-        }
-
+        const song = await searchSpotify(query);
         if (!song) return null;
 
-        const previewUrl = song.preview_url || song.preview;
-        if (!previewUrl) return null;
+        const previewUrl =
+            song.preview_url || (await getSpotifyPreviewUrl(song.id));
 
-        const fileName = `${song.id || song.title.replace(/\s+/g, "_")}.mp3`;
+        if (!previewUrl) {
+            console.log("No preview URL available, trying fallback");
+            return null;
+        }
+
+        const fileName = `spotify_${song.id}.mp3`;
         const filePath = path.join(__dirname, "..", "audio", fileName);
+
         await audioService.downloadAudio(previewUrl, filePath);
 
         return {
